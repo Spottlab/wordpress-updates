@@ -1,0 +1,312 @@
+# Spottlab's update workflow. When Spottlab starts the repository's spottlab.yml workflow, it updates
+# WordPress and its plugins on spottlab/updates/<branch> and opens a pull request into <branch>, the
+# branch Spottlab started it on. Merging it deploys as usual. In .github/workflows/spottlab.yml:
+#
+#   name: Spottlab updates
+#   on: workflow_dispatch
+#   jobs:
+#     updates:
+#       uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.0
+#       permissions:
+#         contents: write
+#         pull-requests: write
+#
+# Spottlab passes nothing to it: what to update comes from the repository and from WordPress.org or
+# Composer, and the token Spottlab holds can start workflows and nothing more. Both ways a site keeps
+# WordPress in its repository work:
+#
+#  - Composer (Bedrock, roots/wordpress, WPackagist, WP Packages): composer.json and
+#    composer.lock get the newest versions, a pinned version staying pinned and a caret a caret.
+#  - WordPress committed as it is: wp-cli updates core, the plugins from WordPress.org and their
+#    translations, in a WordPress of the job's own, on a database that lasts as long as the job.
+#
+# Plugins from anywhere else, such as ACF Pro, are left as they are.
+name: Spottlab WordPress updates
+
+on:
+  workflow_call:
+    inputs:
+      php:
+        description: The PHP version your site runs.
+        type: string
+        default: '8.4'
+    secrets:
+      COMPOSER_AUTH:
+        description: Composer's credentials, for private repositories in composer.json.
+        required: false
+
+jobs:
+  updates:
+    runs-on: ubuntu-latest
+    container: php:${{ inputs.php }}-cli
+    # For WordPress committed as it is: wp-cli updates only an installed WordPress.
+    services:
+      spottlab-db:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: spottlab
+          MARIADB_DATABASE: wordpress
+    env:
+      SPOTTLAB_DB_HOST: spottlab-db
+      SPOTTLAB_DB_PASSWORD: spottlab
+      COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+    steps:
+      # actions/checkout makes a Git repository only where Git is installed.
+      - name: Install Git
+        run: command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git >/dev/null)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Update WordPress and plugins
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          say() { printf '%s\n' "$*"; }
+          die() { printf 'Spottlab updates: %s\n' "$*" >&2; exit 1; }
+
+          [ "${GITHUB_ACTIONS:-}" = true ] || die "this runs in GitHub Actions."
+          [ "${GITHUB_REF_TYPE:-}" = branch ] || die "Spottlab starts it on a branch, and this run has none."
+          target=$GITHUB_REF_NAME
+          branch="spottlab/updates/$target"
+          tools=$(mktemp -d)
+          changes=()
+
+          # What the job needs and the image may not have.
+          add() {
+              if command -v apt-get >/dev/null; then
+                  apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+              elif command -v apk >/dev/null; then
+                  apk add --no-cache -q "$@"
+              else
+                  die "the image has no $*: give the job one that does (its image input)."
+              fi
+          }
+
+          # Stage what changed under these paths, leaving out what the repository ignores.
+          stage() {
+              git ls-files -z -m -d -o --exclude-standard -- "$@" | xargs -0 -r git add -A --
+          }
+
+          # Of a list of paths, the one the fewest directories down: the site's own composer.json or
+          # WordPress, not one inside it.
+          shallowest() {
+              awk -F/ '{ print NF "\t" $0 }' | sort -n | awk -F '\t' 'NR == 1 { print $2 }'
+          }
+
+          update_with_composer() {
+              if ! command -v composer >/dev/null; then
+                  curl -sSfL https://getcomposer.org/download/latest-stable/composer.phar -o "$tools/composer"
+                  chmod +x "$tools/composer"
+                  PATH="$tools:$PATH"
+              fi
+              export COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1
+              locked() {
+                  php -r '
+                      $lock = json_decode(file_get_contents("composer.lock"), true) ?: [];
+                      foreach ([...$lock["packages"] ?? [], ...$lock["packages-dev"] ?? []] as $package) {
+                          echo $package["name"], "\t", $package["version"], "\n";
+                      }'
+              }
+              local before outdated name latest constraint version
+              before=$(locked)
+              # name<TAB>newest stable release, for WordPress and every plugin with one
+              outdated=$(composer outdated --locked --direct --format=json | php -r '
+                  $data = json_decode(stream_get_contents(STDIN), true) ?: [];
+                  foreach ($data["locked"] ?? $data["installed"] ?? [] as $package) {
+                      if (preg_match("#^(roots/wordpress(-no-content|-full)?|johnpbloch/wordpress(-core)?|wpackagist-plugin/.+|wp-plugin/.+)$#", $package["name"])
+                          && preg_match("/^v?\d+(\.\d+)*$/", $package["latest"] ?? "")) {
+                          echo $package["name"], "\t", $package["latest"], "\n";
+                      }
+                  }')
+              local requires=() updates=()
+              while IFS=$'\t' read -r name latest; do
+                  if [ -z "$name" ]; then continue; fi
+                  constraint=$(php -r '$json = json_decode(file_get_contents("composer.json"), true) ?: []; echo $json["require"][$argv[1]] ?? "";' "$name")
+                  # As it was written: a pinned version stays pinned, a caret stays a caret, and
+                  # anything else is updated as far as it allows.
+                  if [[ $constraint =~ ^v?[0-9]+(\.[0-9]+)*$ ]]; then
+                      requires+=("$name:$latest")
+                  elif [[ $constraint == ^* ]]; then
+                      requires+=("$name:^$latest")
+                  else
+                      updates+=("$name")
+                  fi
+              done <<<"$outdated"
+              # The lock file only: the deploy installs from it as usual.
+              local flags=(--no-install --no-scripts --ignore-platform-req='ext-*' --quiet)
+              if [ "${#requires[@]}" -gt 0 ]; then composer require "${requires[@]}" --update-with-dependencies "${flags[@]}"; fi
+              if [ "${#updates[@]}" -gt 0 ]; then composer update "${updates[@]}" --with-dependencies "${flags[@]}"; fi
+              declare -A was=()
+              while IFS=$'\t' read -r name version; do
+                  if [ -n "$name" ]; then was[$name]=$version; fi
+              done <<<"$before"
+              while IFS=$'\t' read -r name version; do
+                  if [ -n "$name" ] && [ "${was[$name]:-}" != "$version" ]; then changes+=("$name ${was[$name]:-new} → $version"); fi
+              done <<<"$(locked)"
+              stage composer.json composer.lock
+          }
+
+          update_with_wp_cli() {
+              php -r 'exit(extension_loaded("mysqli") ? 0 : 1);' || docker-php-ext-install mysqli >/dev/null 2>&1 \
+                  || die "PHP in the image has no mysqli, which WordPress needs: give the job an image with it (its image input)."
+              curl -sSfL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$tools/wp-cli.phar"
+              # The site's plugins, theme and must-use plugins never run: they are only files to replace.
+              wp() { php "$tools/wp-cli.phar" --path="$PWD" --skip-plugins --skip-themes --allow-root "$@"; }
+
+              php -r '
+                  mysqli_report(MYSQLI_REPORT_OFF);
+                  for ($try = 1; $try <= 30; $try++) {
+                      if (! (@new mysqli($argv[1], "root", $argv[2], "wordpress"))->connect_errno) {
+                          exit(0);
+                      }
+                      sleep(2);
+                  }
+                  fwrite(STDERR, "Spottlab updates: the database service did not start.\n");
+                  exit(1);
+              ' "$SPOTTLAB_DB_HOST" "$SPOTTLAB_DB_PASSWORD"
+              # The job's own wp-config.php, kept out of the commit. No bundled themes or plugins from a
+              # core update, no background updates or cron while wp-cli runs.
+              mkdir -p "$tools/mu-plugins"
+              cat > wp-config.php <<PHP
+          <?php
+          define('DB_NAME', 'wordpress');
+          define('DB_USER', 'root');
+          define('DB_PASSWORD', '$SPOTTLAB_DB_PASSWORD');
+          define('DB_HOST', '$SPOTTLAB_DB_HOST');
+          define('WPMU_PLUGIN_DIR', '$tools/mu-plugins');
+          define('CORE_UPGRADE_SKIP_NEW_BUNDLED', true);
+          define('AUTOMATIC_UPDATER_DISABLED', true);
+          define('DISABLE_WP_CRON', true);
+          define('FS_METHOD', 'direct');
+          \$table_prefix = 'wp_';
+          if (! defined('ABSPATH')) {
+              define('ABSPATH', __DIR__ . '/');
+          }
+          require_once ABSPATH . 'wp-settings.php';
+          PHP
+              # Drop-ins expect the site's own cache and database servers; they stay out of the commit.
+              rm -f wp-content/db.php wp-content/object-cache.php wp-content/install.php
+              wp core install --url=http://localhost --title=Updates --admin_user=spottlab \
+                  --admin_email=noreply@spottlab.com --skip-email --quiet
+
+              local current available latest outdated name version update_version
+              current=$(wp core version)
+              # Every newer release, minor and major; the update goes to the newest
+              available=$(wp core check-update --field=version)
+              latest=$(grep -E '^[0-9]+(\.[0-9]+)*$' <<<"$available" | sort -V | tail -n 1 || true)
+              local plugins=()
+              outdated=$(wp plugin list --update=available --fields=name,version,update_version --format=csv)
+              while IFS=, read -r name version update_version; do
+                  if [ -z "$name" ]; then continue; fi
+                  plugins+=("$name")
+                  changes+=("$name $version → $update_version")
+              done < <(tail -n +2 <<<"$outdated")
+
+              if [ -n "$latest" ]; then
+                  changes=("WordPress $current → $latest" ${changes[@]+"${changes[@]}"})
+                  wp core update --version="$latest" --quiet
+                  wp language core update --quiet
+                  stage wp-admin wp-includes ':(glob)*' ':(exclude)wp-config.php'
+              fi
+              if [ "${#plugins[@]}" -gt 0 ]; then
+                  wp plugin update "${plugins[@]}" --quiet
+                  wp language plugin update "${plugins[@]}" --quiet
+                  # Exactly as released: a file the .gitignore would skip (*.sql, *.zip, …) can be one
+                  # the plugin needs, and a deploy ships only what is committed.
+                  for name in "${plugins[@]}"; do
+                      git add -A -f -- "wp-content/plugins/$name"
+                  done
+              fi
+              if [ "${#changes[@]}" -gt 0 ]; then stage wp-content/languages; fi
+          }
+
+          command -v php >/dev/null || die "the image has no PHP: give the job one with the PHP your site runs (its image input)."
+          command -v git >/dev/null || add git
+          command -v unzip >/dev/null || add unzip
+          command -v curl >/dev/null || add curl
+
+          # actions/checkout left the job's token in place, so it pushes; the caller gives it
+          # contents: write and pull-requests: write.
+          git config user.name Spottlab
+          git config user.email noreply@spottlab.com
+          git checkout -q -B "$branch"
+
+          composer_json=$(git ls-files -- composer.json '*/composer.json' \
+              | grep -Ev '(^|/)(vendor|node_modules|wp-content|plugins|themes|mu-plugins)/' \
+              | while IFS= read -r file; do
+                  if grep -Eq '"(roots/wordpress|johnpbloch/wordpress|wpackagist-plugin/|wp-plugin/)[^"]*"[[:space:]]*:' "$file"; then printf '%s\n' "$file"; fi
+              done | shallowest) || true
+          version_php=$(git ls-files -- wp-includes/version.php '*/wp-includes/version.php' | shallowest) || true
+
+          if [ -n "$composer_json" ]; then
+              say "WordPress from Composer, in $composer_json."
+              cd "$(dirname "$composer_json")"
+              update_with_composer
+          elif [ -n "$version_php" ]; then
+              root=$(dirname "$(dirname "$version_php")")
+              say "WordPress committed in the repository$([ "$root" = . ] || printf ', in %s' "$root")."
+              cd "$root"
+              update_with_wp_cli
+          else
+              die "found no WordPress: neither one from Composer in a composer.json nor one in the repository."
+          fi
+
+          if [ "${#changes[@]}" -eq 0 ]; then
+              say "Nothing to update on $target: WordPress and its plugins are at their newest versions."
+              exit 0
+          fi
+          say "Updating, on $target:"
+          printf '  %s\n' "${changes[@]}"
+          ! git diff --cached --quiet || die "the updates changed no files."
+
+          title="Update WordPress and plugins"
+          git commit -q -m "$title" -m "$(printf '%s\n' "${changes[@]}")" -m "Found by Spottlab. Merging this deploys it as usual."
+
+          # Already there with exactly this? Then leave the branch and its pull request as they are.
+          if git fetch -q origin "refs/heads/$branch" 2>/dev/null && [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse 'FETCH_HEAD^{tree}')" ]; then
+              say "$branch already has these versions; its pull request into $target is unchanged."
+              exit 0
+          fi
+
+          if ! git push --force origin "HEAD:refs/heads/$branch" 2>&1 | tee "$tools/push.log"; then
+              if grep -qiE 'denied|403' "$tools/push.log"; then
+                  die "GitHub refused the push: the workflow calling this one needs permissions: contents: write."
+              fi
+              die "the push to $branch failed."
+          fi
+
+          # The pull request, opened with the job's token too, which needs Settings → Actions →
+          # General → Workflow permissions → Allow GitHub Actions to create and approve pull requests.
+          api() {
+              curl -sS -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
+          }
+          # One field of GitHub's answer: of the object, or of the first in a list.
+          field() {
+              php -r '$data = json_decode(stream_get_contents(STDIN), true); echo is_array($data) ? ($data[$argv[1]] ?? $data[0][$argv[1]] ?? "") : "";' "$1"
+          }
+          pulls="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls"
+          open=$(api -G "$pulls" --data-urlencode state=open --data-urlencode "base=$target" \
+              --data-urlencode "head=$GITHUB_REPOSITORY_OWNER:$branch" | field html_url)
+          if [ -n "$open" ]; then
+              say "Pushed $branch; its pull request has the new versions: $open"
+              exit 0
+          fi
+
+          description=$(printf 'Found by Spottlab:\n\n'; printf -- '- %s\n' "${changes[@]}"; printf '\nMerging this deploys it as usual.\n')
+          request=$(php -r 'echo json_encode(["title" => $argv[1], "head" => $argv[2], "base" => $argv[3], "body" => $argv[4]]);' \
+              "$title" "$branch" "$target" "$description")
+          response=$(api -X POST "$pulls" -d "$request" -w '\n%{http_code}')
+          status=${response##*$'\n'}
+          response=${response%$'\n'*}
+          if [ "$status" = 201 ]; then
+              say "Pushed $branch, with a pull request into $target: $(field html_url <<<"$response")"
+              exit 0
+          fi
+          message=$(field message <<<"$response")
+          case $message in
+              *"not permitted to create or approve pull requests"*)
+                  die "GitHub refused the pull request: turn on Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests." ;;
+          esac
+          die "GitHub did not open the pull request (HTTP $status): $message"
