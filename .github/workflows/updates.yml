@@ -6,7 +6,7 @@
 #   on: workflow_dispatch
 #   jobs:
 #     updates:
-#       uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.0
+#       uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.1
 #       permissions:
 #         contents: write
 #         pull-requests: write
@@ -226,6 +226,10 @@ jobs:
           command -v unzip >/dev/null || add unzip
           command -v curl >/dev/null || add curl
 
+          # The job runs as root in its container, and the checkout belongs to the runner's user, so
+          # Git refuses to work in it ("not in a git directory"): actions/checkout trusts it only for
+          # its own commands.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # actions/checkout left the job's token in place, so it pushes; the caller gives it
           # contents: write and pull-requests: write.
           git config user.name Spottlab

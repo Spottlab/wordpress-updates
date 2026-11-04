@@ -11,7 +11,7 @@ A reusable GitHub Actions workflow that turns [Spottlab](https://spottlab.com)'s
    on: workflow_dispatch
    jobs:
      updates:
-       uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.0
+       uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.1
        permissions:
          contents: write
          pull-requests: write
@@ -35,7 +35,7 @@ Plugins from anywhere else, such as ACF Pro, are left as they are. A new WordPre
 The job runs on PHP 8.4, and adds Composer and what wp-cli needs. For another version:
 
 ```yaml
-    uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.0
+    uses: spottlab/wordpress-updates/.github/workflows/updates.yml@1.0.1
     with:
       php: '8.3'
 ```
